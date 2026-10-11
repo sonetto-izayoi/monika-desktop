@@ -40,7 +40,7 @@ from google.genai import types
 
 
 # ==============================================================
-# GEMINI
+# GEMINI API KEY
 # ==============================================================
 
 # Read the API key from monika_config.json beside this script. Never hard-code or share it.
@@ -1100,8 +1100,16 @@ class GreetingBubble(QWidget):
         self.close_button.setFixedSize(23, 23)
         self.close_button.setCursor(Qt.PointingHandCursor)
         self.close_button.setStyleSheet(
-            "QPushButton { color: #ffb6c1; background: #4a1c3d; border: 1px solid #ffb6c1; border-radius: 11px; font-size: 17px; }"
-            "QPushButton:hover { color: #ffffff; background: #ff69b4; }"
+                "QPushButton { "
+                "    color: #ffb6c1; "
+                "    background: #4a1c3d; "
+                "    border: 1px solid #ffb6c1; "
+                "    border-radius: 11px; "
+                "    font-size: 17px; "
+                "    font-weight: bold; " # Thêm đậm nếu muốn dấu x rõ hơn
+                "    padding-bottom: 3px; " # Đẩy ký tự lên trên 2-3px để bù khoảng lệch
+                "}"
+                "QPushButton:hover { color: #ffffff; background: #ff69b4; }"
         )
         self.close_button.clicked.connect(self.hide)
         header.addWidget(self.close_button)
