@@ -13,6 +13,8 @@ state = {
 }
 
 state_lock = threading.Lock()
+affection_event = None
+affection_event_id = 0
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -74,6 +76,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
             return
 
+        if self.path == "/affection":
+            global affection_event
+            with state_lock:
+                event = affection_event
+                affection_event = None
+            self.send_json(200, {"event": event})
+            return
+
         self.send_json(
             404,
             {
@@ -83,7 +93,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
 
-        if self.path != "/event":
+        if self.path not in ("/event", "/vpet_chat"):
 
             self.send_json(
                 404,
@@ -110,6 +120,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
             data = json.loads(
                 raw_data.decode("utf-8")
             )
+
+            if self.path == "/vpet_chat":
+                global affection_event, affection_event_id
+                with state_lock:
+                    affection_event_id += 1
+                    affection_event = {
+                        "id": affection_event_id,
+                        "timestamp": data.get("timestamp", 0),
+                        "source": "monika_vpet"
+                    }
+                self.send_json(200, {"status": "queued"})
+                return
 
             message = data.get(
                 "message",
@@ -198,7 +220,9 @@ def main():
     )
     print()
     print("GET  /status")
+    print("GET  /affection")
     print("POST /event")
+    print("POST /vpet_chat")
     print()
     print("Đang chờ MAS / Desktop...")
     print()

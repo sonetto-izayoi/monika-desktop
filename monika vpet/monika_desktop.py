@@ -4,6 +4,9 @@ import time
 import json
 import random
 import ctypes
+import threading
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ctypes import wintypes
 import urllib.request
 import urllib.error
@@ -40,7 +43,7 @@ from google.genai import types
 
 
 # ==============================================================
-# GEMINI API KEY
+# GEMINI
 # ==============================================================
 
 # Read the API key from monika_config.json beside this script. Never hard-code or share it.
@@ -152,6 +155,114 @@ client = (
 # ==============================================================
 
 BRIDGE_URL = "http://127.0.0.1:8765"
+
+# Run the Bridge inside this same Desktop process, so a separate PowerShell
+# window / monika_bridge.py process is not required.
+_BRIDGE_STATE = {
+    "message": "",
+    "mood": "normal",
+    "source": "bridge",
+    "timestamp": 0,
+}
+_BRIDGE_STATE_LOCK = threading.Lock()
+_BRIDGE_SERVER = None
+
+
+class _EmbeddedBridgeHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        # Keep the console quiet unless there is an application-level issue.
+        pass
+
+    def _send_json(self, code, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/":
+            self._send_json(200, {"status": "ok", "service": "Monika Desktop Bridge", "port": 8765})
+            return
+        if self.path == "/status":
+            with _BRIDGE_STATE_LOCK:
+                payload = dict(_BRIDGE_STATE)
+            self._send_json(200, payload)
+            return
+        self._send_json(404, {"error": "Not found"})
+
+    def do_POST(self):
+        if self.path != "/event":
+            self._send_json(404, {"error": "Not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            incoming = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = {
+                "message": str(incoming.get("message", "")),
+                "mood": str(incoming.get("mood", "normal")),
+                "source": str(incoming.get("source", "unknown")),
+                "timestamp": incoming.get("timestamp", time.time()),
+            }
+            with _BRIDGE_STATE_LOCK:
+                _BRIDGE_STATE.update(payload)
+            self._send_json(200, {"status": "received"})
+        except Exception as exc:
+            self._send_json(400, {"status": "error", "error": str(exc)})
+
+
+def start_embedded_bridge():
+    """Start the local HTTP bridge in a daemon thread exactly once."""
+    global _BRIDGE_SERVER
+    if _BRIDGE_SERVER is not None:
+        return True
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 8765), _EmbeddedBridgeHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, name="MonikaBridge", daemon=True)
+        thread.start()
+        _BRIDGE_SERVER = server
+        print("[Monika Bridge] Embedded bridge running at http://127.0.0.1:8765")
+        return True
+    except OSError as exc:
+        # If a standalone monika_bridge.py is already running, use it.
+        print("[Monika Bridge] Could not start embedded bridge:", repr(exc))
+        return False
+
+
+def stop_embedded_bridge():
+    global _BRIDGE_SERVER
+    server = _BRIDGE_SERVER
+    _BRIDGE_SERVER = None
+    if server is not None:
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
+
+def post_bridge_event(message, mood="normal", source="vpet"):
+    """Send a desktop-pet chat event to the local MAS bridge."""
+    payload = {
+        "message": str(message),
+        "mood": str(mood),
+        "source": str(source),
+        "timestamp": time.time(),
+    }
+    request = urllib.request.Request(
+        BRIDGE_URL + "/event",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=1) as response:
+            return response.getcode() == 200
+    except Exception as exc:
+        print("[Bridge POST error]", repr(exc))
+        return False
 
 def get_mas_pid_from_args_or_env():
     """Read MAS PID from command line first (reliable even if env passing fails)."""
@@ -327,7 +438,12 @@ class BridgePoller(QThread):
                     0
                 )
 
+                # Do not echo this app's own chat message back into its chat window.
+                source = data.get("source", "")
+
                 if (
+                    source != "vpet"
+                    and
                     message
                     and
                     (
@@ -731,6 +847,9 @@ class ChatWindow(QWidget):
 
             return
 
+        # Send only the user's message to MAS; Monika's AI reply does not award a second event.
+        post_bridge_event(user_text, mood="thinking", source="vpet")
+
         self.input_field.clear()
 
         self.input_field.setEnabled(
@@ -922,6 +1041,8 @@ class DraggableLabel(QLabel):
                 -
                 self.drag_position
             )
+            if hasattr(self.parent_widget, "system_monitor"):
+                self.parent_widget.system_monitor.reposition()
 
             event.accept()
 
@@ -1061,6 +1182,246 @@ class DraggableLabel(QLabel):
         menu.exec(
             event.globalPos()
         )
+
+
+
+
+# ==============================================================
+# MONIKA SYSTEM MONITOR (CPU / RAM / GPU, no temperatures)
+# ==============================================================
+
+class UsageBar(QFrame):
+    def __init__(self, color):
+        super().__init__()
+        self.setFixedHeight(5)
+        self.setMinimumWidth(60)
+        self.setStyleSheet(
+            "QFrame { background: #55384e; border: none; border-radius: 2px; }"
+        )
+        self.fill = QFrame(self)
+        self.fill.setStyleSheet(
+            f"QFrame {{ background: {color}; border: none; border-radius: 2px; }}"
+        )
+        self.percent = 0
+
+    def set_percent(self, percent):
+        self.percent = max(0, min(100, int(percent)))
+        self._update_fill()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_fill()
+
+    def _update_fill(self):
+        self.fill.setGeometry(
+            0, 0, int(self.width() * self.percent / 100), self.height()
+        )
+
+
+class SystemMonitor(QWidget):
+    """Small expandable hardware-usage panel anchored below Monika."""
+
+    def __init__(self, pet):
+        super().__init__(None)
+        self.pet = pet
+        self.expanded = True
+        self.setWindowFlags(
+            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 2, 2, 2)
+        outer.setSpacing(0)
+
+        self.card = QFrame(self)
+        self.card.setStyleSheet(
+            "QFrame { background: rgba(35, 13, 32, 238); "
+            "border: 1px solid #ffb6c1; border-radius: 9px; }"
+        )
+        card_layout = QVBoxLayout(self.card)
+        card_layout.setContentsMargins(8, 5, 8, 7)
+        card_layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+
+        self.title = QLabel("♡ SYSTEM")
+        self.title.setStyleSheet(
+            "color: #ff9fc8; font-size: 10px; font-weight: bold; "
+            "background: transparent; border: none;"
+        )
+        header.addWidget(self.title)
+
+        # Dùng addStretch để đẩy toàn bộ lùi về bên trái, giữ nguyên vị trí cân đối
+        header.addStretch(1)
+
+        card_layout.addLayout(header)
+
+        self.details = QWidget()
+        self.details.setStyleSheet("background: transparent; border: none;")
+        details_layout = QVBoxLayout(self.details)
+        details_layout.setContentsMargins(0, 1, 0, 0)
+        details_layout.setSpacing(4)
+
+        self.value_labels = {}
+        self.bars = {}
+        for key, label, bar_color in (
+            ("CPU", "CPU", "#68d391"),
+            ("RAM", "RAM", "#f6c453"),
+            ("GPU", "GPU", "#75b7ff"),
+        ):
+            line = QHBoxLayout()
+            line.setContentsMargins(0, 0, 0, 0)
+            name = QLabel(label)
+            name.setFixedWidth(30)
+            name.setStyleSheet(
+                "color: #fff0f5; font-size: 10px; background: transparent; border: none;"
+            )
+            value = QLabel("--")
+            value.setFixedWidth(32)
+            value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            value.setStyleSheet(
+                "color: #fff0f5; font-size: 10px; background: transparent; border: none;"
+            )
+            bar_bg = UsageBar(bar_color)
+            line.addWidget(name)
+            line.addWidget(bar_bg, 1)
+            line.addWidget(value)
+            details_layout.addLayout(line)
+            self.value_labels[key] = value
+            self.bars[key] = bar_bg
+
+        card_layout.addWidget(self.details)
+        outer.addWidget(self.card)
+
+        self._last_cpu_times = None
+        self._last_gpu_query = 0.0
+        self._gpu_value = None
+        self._gpu_checked = False
+
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh_stats)
+        self.refresh_timer.start(1500)
+        self.refresh_stats()
+        self.adjustSize()
+
+    def _set_value(self, key, value):
+        label = self.value_labels[key]
+        if value is None:
+            label.setText("--")
+            percent = 0
+        else:
+            percent = max(0, min(100, int(value)))
+            label.setText(f"{percent}%")
+        self.bars[key].set_percent(percent)
+
+    def _cpu_percent(self):
+        # Use psutil if installed; otherwise use Windows' built-in GetSystemTimes.
+        try:
+            import psutil
+            return psutil.cpu_percent(interval=None)
+        except Exception:
+            try:
+                idle = ctypes.c_ulonglong()
+                kernel = ctypes.c_ulonglong()
+                user = ctypes.c_ulonglong()
+                if not ctypes.windll.kernel32.GetSystemTimes(
+                    ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+                ):
+                    return None
+                current = (idle.value, kernel.value, user.value)
+                previous = self._last_cpu_times
+                self._last_cpu_times = current
+                if previous is None:
+                    return None
+                idle_delta = current[0] - previous[0]
+                total_delta = (current[1] - previous[1]) + (current[2] - previous[2])
+                if total_delta <= 0:
+                    return 0
+                return max(0, min(100, 100 * (total_delta - idle_delta) / total_delta))
+            except Exception:
+                return None
+
+    @staticmethod
+    def _ram_percent():
+        try:
+            import psutil
+            return psutil.virtual_memory().percent
+        except Exception:
+            try:
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", wintypes.DWORD),
+                        ("dwMemoryLoad", wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                status = MEMORYSTATUSEX()
+                status.dwLength = ctypes.sizeof(status)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                    return status.dwMemoryLoad
+            except Exception:
+                pass
+            return None
+
+    def _gpu_percent(self):
+        now = time.monotonic()
+        if self._gpu_checked and now - self._last_gpu_query < 4:
+            return self._gpu_value
+        self._last_gpu_query = now
+        self._gpu_checked = True
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1.2,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                self._gpu_value = float(result.stdout.strip().splitlines()[0].strip())
+            else:
+                self._gpu_value = None
+        except Exception:
+            # nvidia-smi is normally available with NVIDIA drivers. Other GPUs
+            # may need a vendor-specific reader, so show -- rather than inventing data.
+            self._gpu_value = None
+        return self._gpu_value
+
+    def refresh_stats(self):
+        self._set_value("CPU", self._cpu_percent())
+        self._set_value("RAM", self._ram_percent())
+        self._set_value("GPU", self._gpu_percent())
+        self.adjustSize()
+        self.reposition()
+
+    def reposition(self):
+        if not self.pet or not self.pet.isVisible():
+            return
+        pet_rect = self.pet.frameGeometry()
+        screen = self.pet.screen().availableGeometry() if self.pet.screen() else QApplication.primaryScreen().availableGeometry()
+        x = pet_rect.center().x() - self.width() // 2
+        y = pet_rect.bottom() + 2
+        x = max(screen.left() + 4, min(x, screen.right() - self.width() - 4))
+        if y + self.height() > screen.bottom():
+            y = pet_rect.top() - self.height() - 2
+        y = max(screen.top() + 4, min(y, screen.bottom() - self.height() - 4))
+        self.move(x, y)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.reposition()
 
 
 # ==============================================================
@@ -1295,7 +1656,7 @@ class MonikaDesktopPet(QWidget):
         self.chat_window = ChatWindow(
             pet_ref=self
         )
-        self.chat_window.text_display.setText("Xin chào anh! Em là Monika. Double-click vào em để trò chuyện nhé 💚")
+        self.chat_window.text_display.setText("Xin chào anh! Em là Monika💚")
 
         # ==========================================================
         # BRIDGE
@@ -1315,10 +1676,12 @@ class MonikaDesktopPet(QWidget):
             "Anh quay lại rồi! Hôm nay anh thế nào? 🌸",
             "Chào anh~ Có em ở đây cùng anh nhé! 💚",
             "Anh gọi em đó hả? Em đây nè! ✨",
-            "Chào anh, nhớ nghỉ ngơi một chút nha! 🌷",
+            "Chào anh, em nhớ anh nhiều lắm đó! 🌷",
         ]
         self.greeting_bubble = GreetingBubble()
+        self.system_monitor = SystemMonitor(self)
         QTimer.singleShot(900, self.show_greeting)
+        QTimer.singleShot(250, self.system_monitor.show)
 
         # Global hotkey: Ctrl+Alt+M toggles the pet, even when hidden.
         self._hotkey_was_down = False
@@ -1382,10 +1745,17 @@ class MonikaDesktopPet(QWidget):
             if down and not self._hotkey_was_down:
                 if self.isVisible():
                     self.hide()
+                    if hasattr(self, "system_monitor"):
+                        self.system_monitor.hide()
+                    if hasattr(self, "greeting_bubble"):
+                        self.greeting_bubble.hide()
                 else:
                     self.show()
                     self.raise_()
                     self.activateWindow()
+                    if hasattr(self, "system_monitor"):
+                        self.system_monitor.show()
+                        self.system_monitor.reposition()
                     self.show_greeting()
             self._hotkey_was_down = down
         except Exception:
@@ -1606,6 +1976,8 @@ class MonikaDesktopPet(QWidget):
         self.resize(
             scaled_pixmap.size()
         )
+        if hasattr(self, "system_monitor"):
+            self.system_monitor.reposition()
 
     def scale_image(
         self,
@@ -1628,10 +2000,28 @@ class MonikaDesktopPet(QWidget):
     # CLEANUP
     # ==============================================================
 
+    def hideEvent(self, event):
+        if hasattr(self, "system_monitor"):
+            self.system_monitor.hide()
+        if hasattr(self, "greeting_bubble"):
+            self.greeting_bubble.hide()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, "system_monitor"):
+            self.system_monitor.show()
+            self.system_monitor.reposition()
+
     def closeEvent(
         self,
         event
     ):
+
+        if hasattr(self, "system_monitor"):
+            self.system_monitor.close()
+        if hasattr(self, "greeting_bubble"):
+            self.greeting_bubble.close()
 
         if hasattr(
             self,
@@ -1653,14 +2043,14 @@ class MonikaDesktopPet(QWidget):
 
 if __name__ == "__main__":
 
-    app = QApplication(
-        sys.argv
-    )
+    app = QApplication(sys.argv)
+    start_embedded_bridge()
+    app.aboutToQuit.connect(stop_embedded_bridge)
 
     pet = MonikaDesktopPet()
-
     pet.show()
 
-    sys.exit(
-        app.exec()
-    )
+    try:
+        sys.exit(app.exec())
+    finally:
+        stop_embedded_bridge()
